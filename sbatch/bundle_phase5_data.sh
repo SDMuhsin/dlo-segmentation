@@ -57,8 +57,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ----------------------------------------------------------------------------
-# Inputs (all relative to the script's project root, same as the training
-# script's hard-coded PROJECT_ROOT). Run this from /workspace/kiat_crefle.
+# Inputs (all relative to the script's project root). PROJECT_ROOT is
+# resolved from this script's path, so it works wherever the project tree
+# lives (e.g. /workspace/kiat_crefle on dev, ~/projects/.../dlo-segmentation
+# on rorqual login).
 # ----------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -151,8 +153,8 @@ ls -lh "$OUTPUT"
 
 # ----------------------------------------------------------------------------
 # Verify the tar lists exactly the files we expect.  This catches edge
-# cases like /workspace/kiat_crefle/data/.../symlink-pointing-to-deleted
-# (would produce a tar with a 0-byte entry instead of erroring).
+# cases like a data/.../symlink-pointing-to-deleted (would produce a tar
+# with a 0-byte entry instead of erroring).
 # ----------------------------------------------------------------------------
 echo ""
 echo "Tar contents (one entry per input):"

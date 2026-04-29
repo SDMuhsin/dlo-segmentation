@@ -45,24 +45,29 @@
 #               committing to a long run
 #   (default)   4× H100 80GB DDP, 6 h, 80 epochs, batch 8/GPU, lr 1e-4
 #
-# Pre-requisites (each is a one-shot script — do them in order, once):
+# Pre-requisites (do them in this order, once):
 #
-#   1. ON DEV BOX:    ./sbatch/sync_to_rorqual.sh --user <rorqual-user>
-#                     (bundles ./phase5_data.tar; rsyncs to /scratch/<user>/)
+#   1. ON DEV:        ./sbatch/bundle_phase5_data.sh --output ./phase5_data.tar
+#                     (script — produces the ~14 GB tar)
 #
-#   2. ON LOGIN:      ./sbatch/bootstrap_rorqual_env.sh
-#                     (creates env/ with the right Alliance modules+wheels)
+#   2. ON DEV:        rsync the tar to rorqual /scratch (MANUAL — 2FA prompt):
+#                       rsync -P --partial --inplace ./phase5_data.tar \
+#                         <user>@rorqual.alliancecan.ca:/scratch/<user>/
 #
-# Then per submission:
+#   3. ON LOGIN:      ./sbatch/bootstrap_rorqual_env.sh
+#                     (script — creates env/ with the right Alliance modules+wheels)
 #
-#   ON LOGIN:         ./sbatch/run_dformer_v2_dlo.sh --smoke \
-#                         --data-tar /scratch/<user>/phase5_data.tar
+# Then per submission, ON LOGIN:
 #
-#                     ./sbatch/run_dformer_v2_dlo.sh \
-#                         --data-tar /scratch/<user>/phase5_data.tar
+#   ./sbatch/run_dformer_v2_dlo.sh --smoke \
+#       --data-tar /scratch/<user>/phase5_data.tar
 #
-# All four scripts share the same flag conventions and refuse to run on the
-# wrong node (e.g. bootstrap exits if `module` isn't in PATH).
+#   ./sbatch/run_dformer_v2_dlo.sh \
+#       --data-tar /scratch/<user>/phase5_data.tar
+#
+# Each script refuses to run on the wrong node (e.g. bootstrap exits if
+# `module` isn't in PATH).  See llmdocs/trackers/phase5_dformer_v2_tracker.md
+# for the full pipeline diagram.
 #
 # Output (on /home or /project, since the GPU node shares them with login):
 #   - results/dformer_v2_dlo/<tag>/{best_model.pth, epoch_*.pth,

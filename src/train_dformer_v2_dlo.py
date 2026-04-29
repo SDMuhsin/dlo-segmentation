@@ -7,12 +7,17 @@ is collapsed to a 2-class label inside `__getitem__`:
     cache label gt_transform: 0=Wire, 1=Endpoint, 2=Bifurcation, 3=Connector, 4=Noise, 255=bg
     binary: classes 0..3 -> 1 (DLO); class 4 (Noise) and 255 (bg) -> 0 (bg)
 
-Usage examples (run from /workspace/kiat_crefle):
+Usage examples (run from project root):
     source env/bin/activate
     torchrun --nproc_per_node=2 src/train_dformer_v2_dlo.py --smoke a --batch-size 4
     torchrun --nproc_per_node=2 src/train_dformer_v2_dlo.py --smoke b --batch-size 4
     torchrun --nproc_per_node=2 src/train_dformer_v2_dlo.py --smoke c --batch-size 4
     torchrun --nproc_per_node=2 src/train_dformer_v2_dlo.py --epochs 80 --batch-size 4
+
+PROJECT_ROOT is derived from this file's location, so the script works
+unchanged whether it lives at /workspace/kiat_crefle/src/... (dev box) or
+/home/<user>/.../dlo-segmentation/src/... (rorqual).  --data-dir and
+--pretrained accept absolute paths to override the defaults.
 """
 
 import argparse
@@ -43,7 +48,7 @@ from train_rgbd_seg import build_cache  # noqa: E402
 
 # ─────────────────────────── CONFIG ───────────────────────────
 
-PROJECT_ROOT = "/workspace/kiat_crefle"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATASET_DIR_DEFAULT = os.path.join(PROJECT_ROOT, "data", "dformer_dataset")
 RESULTS_DIR_DEFAULT = os.path.join(PROJECT_ROOT, "results", "dformer_v2_dlo")
 PRETRAINED_DEFAULT = os.path.join(
