@@ -293,6 +293,11 @@ WRAP_BODY="
 set -euo pipefail
 
 # Some Alliance images don't auto-source lmod for non-interactive shells.
+# Relax \`set -u\` around the cvmfs source + module loads: Alliance's
+# /cvmfs/.../profile/bash.sh and Lmod's internals reference variables
+# (e.g. SKIP_CC_CVMFS) without \`\${var:-}\` defaults, which aborts under
+# nounset.  Re-enable -u immediately after.
+set +u
 if [[ -r /cvmfs/soft.computecanada.ca/config/profile/bash.sh ]]; then
     source /cvmfs/soft.computecanada.ca/config/profile/bash.sh
 fi
@@ -303,6 +308,7 @@ module load python
 module load scipy-stack
 module load cuda cudnn
 module load arrow
+set -u
 
 source env/bin/activate
 export PYTHONPATH=\"\$(pwd):\${PYTHONPATH:-}\"

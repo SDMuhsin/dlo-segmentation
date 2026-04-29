@@ -109,6 +109,12 @@ echo "================================================================"
 # Make `module` work in non-interactive shells (lmod ships an autoload
 # function; on some Alliance images the function isn't sourced for
 # `bash -c` / scripts.  Force-source the public lmod init).
+#
+# Relax `set -u` around the cvmfs source + module loads: Alliance's
+# /cvmfs/.../profile/bash.sh and Lmod's internals reference variables
+# (e.g. SKIP_CC_CVMFS) without `${var:-}` defaults, which aborts under
+# nounset.  Re-enable -u immediately after.
+set +u
 if [[ -r /cvmfs/soft.computecanada.ca/config/profile/bash.sh ]]; then
     # shellcheck disable=SC1091
     source /cvmfs/soft.computecanada.ca/config/profile/bash.sh
@@ -120,6 +126,7 @@ module load "$PYTHON_MODULE"
 module load scipy-stack
 module load cuda cudnn
 module load arrow
+set -u
 
 echo ""
 echo "Loaded:"
