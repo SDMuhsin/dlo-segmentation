@@ -164,15 +164,26 @@ echo "================================================================"
 echo "Step 3/4: pip install (wheelhouse first, PyPI fallback)"
 echo "================================================================"
 
-# Install torch + torchvision TOGETHER in a single pip call so the resolver
-# can see both metadata at once and pick ABI-compatible versions.  Per-
-# package install picks the latest of each independently, which produces
-# a torch / torchvision pair that mismatches at runtime (e.g. torchvision
-# expecting torch.library.register_fake — added in torch 2.4 — when the
-# wheelhouse default torch is older).
-echo "install torch + torchvision  ... "
-if pip install --no-index torch torchvision >/tmp/pip_$$.log 2>&1; then
-    echo "  ok (wheelhouse, resolved together)"
+# Pin torch + torchvision to a KNOWN-COMPATIBLE pair.
+#
+# Background: the Alliance wheelhouse's torchvision metadata is too loose
+# to be trusted — pip will happily pair (e.g.) torchvision 0.21 with torch
+# 2.1.2 and let it crash at runtime on `torch.library.register_fake` (added
+# in torch 2.4).  Co-installing in one pip call is NOT enough; we have to
+# pin explicitly.
+#
+# torch 2.1.2 + torchvision 0.16.2 is the upstream-compatible pair for the
+# rorqual gentoo2023/x86-64-v3 wheelhouse default.  If the wheelhouse ever
+# ships a newer torch, bump both numbers to a matching pair (see
+# https://github.com/pytorch/vision#installation for the official torch ↔
+# torchvision compatibility table).
+TORCH_VER=2.1.2
+TORCHVISION_VER=0.16.2
+echo "install torch==$TORCH_VER + torchvision==$TORCHVISION_VER ..."
+if pip install --no-index "torch==$TORCH_VER" "torchvision==$TORCHVISION_VER" >/tmp/pip_$$.log 2>&1; then
+    echo "  ok (wheelhouse, pinned compatible pair)"
+elif pip install "torch==$TORCH_VER" "torchvision==$TORCHVISION_VER" >/tmp/pip_$$.log 2>&1; then
+    echo "  ok (PyPI fallback)"
 else
     echo "  FAILED"
     tail -30 /tmp/pip_$$.log | sed 's/^/  /'
@@ -199,6 +210,7 @@ WHEELHOUSE_PKGS=(
     tensorboardX
     timm
     easydict
+    termcolor
     mmengine
     mmcv
 )
