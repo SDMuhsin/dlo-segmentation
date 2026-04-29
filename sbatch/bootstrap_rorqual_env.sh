@@ -126,6 +126,11 @@ module load "$PYTHON_MODULE"
 module load scipy-stack
 module load cuda cudnn
 module load arrow
+# OpenCV on Alliance is shipped as a system module (cv2 importable via cvmfs
+# PYTHONPATH); the wheelhouse intentionally ships an `opencv-noinstall`
+# dummy wheel that errors on install.  Load BEFORE virtualenv creation so
+# the venv inherits the cvmfs path that exposes cv2.
+module load opencv
 set -u
 
 echo ""
@@ -159,13 +164,31 @@ echo "================================================================"
 echo "Step 3/4: pip install (wheelhouse first, PyPI fallback)"
 echo "================================================================"
 
+# Install torch + torchvision TOGETHER in a single pip call so the resolver
+# can see both metadata at once and pick ABI-compatible versions.  Per-
+# package install picks the latest of each independently, which produces
+# a torch / torchvision pair that mismatches at runtime (e.g. torchvision
+# expecting torch.library.register_fake — added in torch 2.4 — when the
+# wheelhouse default torch is older).
+echo "install torch + torchvision  ... "
+if pip install --no-index torch torchvision >/tmp/pip_$$.log 2>&1; then
+    echo "  ok (wheelhouse, resolved together)"
+else
+    echo "  FAILED"
+    tail -30 /tmp/pip_$$.log | sed 's/^/  /'
+    rm -f /tmp/pip_$$.log
+    exit 1
+fi
+rm -f /tmp/pip_$$.log
+
 # Packages needed by src/train_dformer_v2_dlo.py and the dformer code.
 # Versions kept loose so the wheelhouse can pick what's actually built.
 # Order: stable / common packages first, mmcv last (it's the most fragile
 # and frequently the one that needs PyPI fallback).
+# NOTE: opencv-python-headless is intentionally NOT here — Alliance ships
+# OpenCV as a module (loaded above), and the wheelhouse opencv wheel is a
+# dummy that errors on install by design.
 WHEELHOUSE_PKGS=(
-    torch
-    torchvision
     numpy
     scipy
     matplotlib
@@ -176,7 +199,6 @@ WHEELHOUSE_PKGS=(
     tensorboardX
     timm
     easydict
-    opencv-python-headless
     mmengine
     mmcv
 )

@@ -308,6 +308,9 @@ module load python
 module load scipy-stack
 module load cuda cudnn
 module load arrow
+# OpenCV via system module (cv2 importable through cvmfs PYTHONPATH).
+# Must be loaded BEFORE activating the venv so the path is set up.
+module load opencv
 set -u
 
 source env/bin/activate
