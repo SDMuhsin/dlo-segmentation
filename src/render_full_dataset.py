@@ -130,9 +130,30 @@ def preflight() -> bool:
     ok &= len(photos) >= 8
 
     objs = _get_object_library()
-    print(f"  [{'OK' if len(objs) >= 5 else 'FAIL'}] 3D real-object PCLs: "
-          f"{len(objs)} (expected ≥ 5)")
-    ok &= len(objs) >= 5
+    n_obj_total = len(objs)
+    print(f"  [{'OK' if n_obj_total >= 200 else 'FAIL'}] 3D real-object PCLs: "
+          f"{n_obj_total} (expected ≥ 200 for v2)")
+    ok &= n_obj_total >= 200
+
+    # Phase 8 v2: tightened thresholds — library must be at the v2 scale,
+    # not the v1 scale. 30+ hands, 18+ grippers, 30+ cables.
+    hands = sum(1 for o in objs if o.get("category") == "hand")
+    grippers = sum(1 for o in objs if o.get("category") == "gripper")
+    arms = sum(1 for o in objs if o.get("category") == "arm")
+    cables = sum(1 for o in objs if o.get("category") == "negative_wire_like")
+    graspables = sum(1 for o in objs if o.get("graspable_on_wire"))
+    print(f"  [{'OK' if hands >= 30 else 'FAIL'}] hand variants: "
+          f"{hands} (expected ≥ 30)")
+    print(f"  [{'OK' if grippers + arms >= 18 else 'FAIL'}] "
+          f"gripper+arm variants: {grippers}+{arms}={grippers + arms} (expected ≥ 18)")
+    print(f"  [{'OK' if cables >= 30 else 'FAIL'}] negative-wire-like "
+          f"clutter: {cables} (expected ≥ 30)")
+    print(f"  [{'OK' if graspables >= 30 else 'FAIL'}] graspable-on-wire "
+          f"objects: {graspables} (expected ≥ 30)")
+    ok &= hands >= 30
+    ok &= grippers + arms >= 18
+    ok &= cables >= 30
+    ok &= graspables >= 30
 
     manifest = PROJECT_ROOT / "data" / "objects" / "manifest.json"
     if manifest.is_file():
@@ -249,8 +270,13 @@ def main() -> int:
         description="Render the full PointWire dataset to RGB-D videos with the Phase 4 pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--workers", type=int, default=8,
-                        help="Worker processes for the multiprocess pool.")
+    def _positive_int(s: str) -> int:
+        n = int(s)
+        if n < 1:
+            raise argparse.ArgumentTypeError(f"must be ≥ 1, got {n}")
+        return n
+    parser.add_argument("--workers", type=_positive_int, default=8,
+                        help="Worker processes for the multiprocess pool (≥ 1).")
     parser.add_argument("--num-frames", type=int, default=20,
                         help="Animation frames per source frame.")
     parser.add_argument("--max-angle", type=float, default=25.0,
@@ -306,10 +332,11 @@ def main() -> int:
     print(f"  PNG triples:        {total_src * args.num_frames * len(VIEW_NAMES):,}")
     print(f"  total PNG files:    {n_pngs:,}")
     print(f"  point clouds:       {n_pcl:,}")
-    # Phase 4 measured: ≈ 25-27 s/source for 5 anim × 6 views (single proc),
-    # i.e. ≈ 5 s per anim-frame (where one anim-frame = all 6 views).
-    # Linear in num_frames per source, divided by worker count.
-    per_src_s = 5.0 * args.num_frames  # 5 s × num_anim_frames × 6 views
+    # Phase 8 v2 smoke measured: ≈ 260 s/source for 20 anim × 6 views
+    # (single-process), i.e. ≈ 13 s per anim-frame (one anim-frame = 6 views).
+    # ~3× Phase 4 because BG_N_POINTS doubled (30k → 60k) and FG_N_POINTS
+    # tripled (8k → 24k). Linear in num_frames; divided by worker count.
+    per_src_s = 13.0 * args.num_frames
     est_h = total_src * per_src_s / args.workers / 3600
     print(f"  est wall:           {est_h:.1f} h on {args.workers} workers")
     print()

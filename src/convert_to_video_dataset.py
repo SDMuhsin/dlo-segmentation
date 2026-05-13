@@ -41,7 +41,11 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT / "data" / "set2"
-OUTPUT_ROOT = PROJECT_ROOT / "data" / "rgbd_videos"
+# Phase 8: render to a NEW directory so the Phase 4 dataset at
+# data/rgbd_videos/ stays intact. Override via the OUTPUT_ROOT env var if
+# you want to render somewhere else.
+_OUTPUT_ROOT_DEFAULT = PROJECT_ROOT / "data" / "rgbd_videos_v2"
+OUTPUT_ROOT = Path(os.environ.get("KIAT_OUTPUT_ROOT", str(_OUTPUT_ROOT_DEFAULT)))
 
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from pcl_to_rgbd import (
@@ -54,6 +58,7 @@ from texture_mapping import (
     BG_LABEL,
     compute_per_point_rgb,
     generate_background_scene,
+    generate_foreground_scene,
     load_background_library,
     load_object_library,
     load_texture_library,
@@ -94,9 +99,14 @@ def _get_object_library():
         )
     return _OBJ_LIBRARY_CACHE
 
-# Number of background points sampled per source frame's 3D scene. Held at the
-# module level so a worker process pays a single allocation per call.
-BG_N_POINTS = 30000
+# Number of background points sampled per source frame's 3D scene. v2 doubled
+# from v1's 30k → 60k to support 10-15 bg objects without aliasing.
+BG_N_POINTS = 60000
+
+# Phase 8 v2 foreground budget: 24000 (3x v1's 8000). With 10-15 fg objects
+# per source, this keeps each at ~1500-2400 points — enough to read as a
+# real object in any view.
+FG_N_POINTS = 24000
 
 TRAIN_SETS = set(range(0, 32))
 VAL_SETS   = set(range(32, 36))
@@ -333,7 +343,7 @@ def convert_one_video(args):
             seed=set_id * 1000 + frame_id,
         )
 
-        # 3D background scene (Phase 4): textured floor + 3-5 real-object
+        # 3D background scene (Phase 4): textured floor + 3-6 real-object
         # PCLs from the CC0 object library scattered around the harness.
         # Built once per source frame and held static across all 20 anim
         # frames + 6 views — the harness animates against a fixed
@@ -354,6 +364,23 @@ def convert_one_video(args):
             bg_pcl = np.empty((0, 3))
             bg_rgb = np.empty((0, 3), dtype=np.uint8)
 
+        # Phase 8: foreground objects (hands/grippers/arms/cables) — built
+        # once per source at the rest-pose skeleton. Pose is computed
+        # against the rest-pose wire so the hand/gripper appears to grip a
+        # plausible point. As the harness animates across the 20 anim
+        # frames, the wire wiggles around the (static) hand by up to ~25°
+        # of joint rotation — that's deliberate, the model sees hands NEAR
+        # wires across many small wire perturbations.
+        fg_pcl, fg_rgb, fg_info = generate_foreground_scene(
+            rng=np.random.RandomState(set_id * 1000 + frame_id + 113),
+            object_library=obj_library or [],
+            bbox_min=pcl.min(axis=0),
+            bbox_max=pcl.max(axis=0),
+            skeleton_nodes=nodes,
+            segments=segments,
+            n_points=FG_N_POINTS,
+        )
+
         # 2D photographic backdrop (Phase 2 → restored in Phase 4).
         # Deterministically picked per source frame; same photo across all
         # 20 anim frames + 6 views so the backdrop is part of one coherent
@@ -366,13 +393,17 @@ def convert_one_video(args):
         else:
             photo_background = None
 
-        # Concatenate harness + bg colour and labels once. Positions for the
-        # harness are concatenated PER ANIMATION FRAME below (only the harness
-        # animates; bg is static).
-        combined_rgb = np.concatenate([point_rgb, bg_rgb], axis=0).astype(np.uint8)
-        combined_labels = np.concatenate(
-            [seg.astype(np.int64), np.full(len(bg_pcl), BG_LABEL, dtype=np.int64)]
-        )
+        # Concatenate harness + bg + fg colour and labels once. Positions
+        # for the harness are concatenated PER ANIMATION FRAME below (only
+        # the harness animates; bg + fg are static so the same arrays are
+        # reused for every anim/view of this source).
+        combined_rgb = np.concatenate(
+            [point_rgb, bg_rgb, fg_rgb], axis=0).astype(np.uint8)
+        combined_labels = np.concatenate([
+            seg.astype(np.int64),
+            np.full(len(bg_pcl), BG_LABEL, dtype=np.int64),
+            np.full(len(fg_pcl), BG_LABEL, dtype=np.int64),
+        ])
 
         # Per-joint random params (deterministic: seed = set_id * 1000 + frame_id)
         rng = np.random.RandomState(set_id * 1000 + frame_id)
@@ -412,8 +443,12 @@ def convert_one_video(args):
             np.save(str(pcl_dir / f"{frame_id:04d}_{ai:02d}.npy"),
                     new_pcl.astype(np.float32))
 
-            # Stitch the (animated) harness with the (static) bg for rendering.
-            combined_pcl = np.concatenate([new_pcl, bg_pcl], axis=0)
+            # Stitch the (animated) harness with the (static) bg + fg for
+            # rendering. Order: harness first so the per-source label .npy
+            # alignment with combined_labels[:N_harness] holds, then bg, then
+            # fg. ``rasterize_view`` is z-buffered so order only affects
+            # tie-breaking on identical-depth pixels.
+            combined_pcl = np.concatenate([new_pcl, bg_pcl, fg_pcl], axis=0)
 
             for vn in VIEW_NAMES:
                 fname = f"{frame_id:04d}_{ai:02d}_{vn}.png"
@@ -525,12 +560,20 @@ def write_metadata(sets_found, num_frames, max_angle_deg, stats):
             "anti_aliasing": "Gaussian-blurred (sigma=2px) source textures + bilinear sampling",
         },
         "background": {
-            "method": "Phase 4: textured xz-floor + 3-5 real-object CC0 point clouds (sampled from Poly Haven mesh assets in data/objects/) placed on the floor outside the harness footprint, COMPOSITED OVER a 2D photographic backdrop. The 3D objects/floor supply geometry/depth; the 2D photo fills pixels with no 3D point. Background points carry a sentinel label (BG_LABEL=255) so the per-pixel label PNG keeps bg=0. The scene is static across all 20 anim frames + 6 views of one source for video coherence (only the harness animates).",
+            "method": "Phase 4: textured xz-floor + 3-6 real-object CC0 point clouds (sampled from Poly Haven mesh assets in data/objects/) placed on the floor outside the harness footprint, COMPOSITED OVER a 2D photographic backdrop. The 3D objects/floor supply geometry/depth; the 2D photo fills pixels with no 3D point. Background points carry a sentinel label (BG_LABEL=255) so the per-pixel label PNG keeps bg=0. The scene is static across all 20 anim frames + 6 views of one source for video coherence (only the harness animates). Phase 8 filters out hand/gripper/arm/negative_wire_like categories from bg clutter (those go to the foreground layer).",
             "n_points_per_scene": BG_N_POINTS,
             "library_dir_3d_objects": "data/objects/",
             "library_dir_photos": "data/textures/backgrounds/",
             "license": "CC0",
             "seed_per_source": "set_id * 1000 + frame_id + 7 for the 3D scene; (set_id * 1000 + frame_id) % len(bg_library) selects the 2D backdrop photo.",
+        },
+        "foreground": {
+            "method": "Phase 8: 0-4 procedural hand / gripper / arm / cable point clouds placed close to or grasping the wire skeleton. Up to 2 'graspable' items (hands or parallel-jaw grippers) are oriented so their grasp_axis_local aligns with a random wire-skeleton tangent and translated so the object centroid lands at the grasp point. Up to 2 free-floating items are placed at random positions in the harness bbox with random Y rotation + small tilt. All foreground points carry the BG_LABEL=255 sentinel (label PNG bg=0). Foreground is static across all 20 anim frames; the wire animates ±25° relative to the hands.",
+            "n_points_per_scene": FG_N_POINTS,
+            "grasp_probability": 0.7,
+            "free_floating_probability": 0.55,
+            "categories_used": ["hand", "gripper", "arm", "negative_wire_like", "rope"],
+            "seed_per_source": "set_id * 1000 + frame_id + 113 — independent stream from bg.",
         },
         "class_names": {str(k): v for k, v in CLASS_NAMES.items()},
         "class_colors_rgb": {str(k): list(v) for k, v in CLASS_COLORS_RGB.items()},

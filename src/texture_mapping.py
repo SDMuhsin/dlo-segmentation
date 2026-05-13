@@ -604,9 +604,19 @@ def load_object_library(
     * ``colors`` — ``(N, 3) uint8`` BGR.
     * ``natural_scale_range`` — ``(lo, hi)`` allowed scale multiplier in the
       harness world frame (per-object calibration in ``manifest.json``).
+    * ``category`` — manifest category (e.g. ``"hand"``, ``"gripper"``,
+      ``"arm"``, ``"negative_wire_like"``, ``"clutter"``, original Phase 4
+      categories like ``"tool"``/``"container"``/etc.). Defaults to
+      ``"unknown"`` if the manifest entry omits it.
+    * ``grasp_axis_local`` — optional ``(3,) float64`` unit vector in the
+      object's local frame indicating the line a wire would lay across when
+      gripped. ``None`` if not provided.
+    * ``graspable_on_wire`` — bool. Marks objects that the foreground placer
+      can pose specifically grasping a wire skeleton point.
 
-    Each entry corresponds to a single CC0 model (see ``manifest.json`` for
-    provenance). Returns ``[]`` if the directory or manifest is missing.
+    Each entry corresponds to a single mesh/procedural model (see
+    ``manifest.json`` for provenance). Returns ``[]`` if the directory or
+    manifest is missing.
     """
     objects_dir = Path(objects_dir)
     manifest_path = objects_dir / "manifest.json"
@@ -636,15 +646,458 @@ def load_object_library(
         if (not isinstance(scale_range, (list, tuple))
                 or len(scale_range) != 2):
             scale_range = (0.20, 0.40)
+        grasp_axis_raw = entry.get("grasp_axis_local")
+        grasp_axis = None
+        if isinstance(grasp_axis_raw, (list, tuple)) and len(grasp_axis_raw) == 3:
+            v = np.asarray(grasp_axis_raw, dtype=np.float64)
+            n = float(np.linalg.norm(v))
+            if n > 1e-9:
+                grasp_axis = v / n
         library.append({
             "slug": entry["slug"],
             "points": pts,
             "colors": cols,
             "natural_scale_range": (float(scale_range[0]),
                                     float(scale_range[1])),
+            "category": entry.get("category", "unknown"),
+            "grasp_axis_local": grasp_axis,
+            "graspable_on_wire": bool(entry.get("graspable_on_wire", False)),
         })
     return library
 
+
+def filter_library_by_category(
+    library: list[dict],
+    categories: set[str] | None = None,
+    exclude: set[str] | None = None,
+) -> list[dict]:
+    """Return a sub-list filtered to ``categories`` (or excluding ``exclude``).
+
+    If ``categories`` is provided, only entries whose ``category`` is in that
+    set are kept. Otherwise all entries are kept. ``exclude`` runs after the
+    inclusion filter and removes any entry whose category is in the set.
+    """
+    out = library
+    if categories is not None:
+        out = [o for o in out if o.get("category") in categories]
+    if exclude:
+        out = [o for o in out if o.get("category") not in exclude]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: rotation helpers for foreground placement
+# ---------------------------------------------------------------------------
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    """3x3 skew-symmetric matrix from a 3-vector (Rodrigues helper)."""
+    return np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0],
+    ], dtype=np.float64)
+
+
+def _rotation_about_axis(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rodrigues' rotation around a unit ``axis`` by ``angle`` (radians)."""
+    axis = np.asarray(axis, dtype=np.float64)
+    n = float(np.linalg.norm(axis))
+    if n < 1e-12:
+        return np.eye(3)
+    a = axis / n
+    K = _skew(a)
+    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+
+
+def _rotation_align(v_from: np.ndarray, v_to: np.ndarray) -> np.ndarray:
+    """Rotation matrix that takes unit ``v_from`` to unit ``v_to``."""
+    v_from = np.asarray(v_from, dtype=np.float64)
+    v_to = np.asarray(v_to, dtype=np.float64)
+    n_from = np.linalg.norm(v_from)
+    n_to = np.linalg.norm(v_to)
+    if n_from < 1e-12 or n_to < 1e-12:
+        return np.eye(3)
+    f = v_from / n_from
+    t = v_to / n_to
+    c = float(np.dot(f, t))
+    if c > 1.0 - 1e-9:
+        return np.eye(3)
+    if c < -1.0 + 1e-9:
+        # Antiparallel — pick any axis perpendicular to f.
+        ortho = _perpendicular_unit(f)
+        return _rotation_about_axis(ortho, np.pi)
+    axis = np.cross(f, t)
+    s = float(np.linalg.norm(axis))
+    if s < 1e-12:
+        return np.eye(3)
+    axis_n = axis / s
+    K = _skew(axis_n)
+    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: wire grasp picker
+# ---------------------------------------------------------------------------
+
+def _pick_wire_grasp_point(
+    rng: np.random.RandomState,
+    nodes: np.ndarray,
+    segments: list[list[int]],
+    interior_frac: tuple[float, float] = (0.2, 0.8),
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Pick a random point along a wire segment and return ``(point, tangent)``.
+
+    Iterates segments preferring longer ones (sampled proportional to total
+    arc length), picks a random interior edge, then a random ``t ∈
+    interior_frac`` along that edge so the hand isn't stuck at endpoints.
+
+    Returns ``None`` if there are no usable segments (degenerate skeleton).
+    """
+    if not segments:
+        return None
+    # Build arc-length-weighted segment selection.
+    seg_lengths = []
+    for seg in segments:
+        if len(seg) < 2:
+            seg_lengths.append(0.0)
+            continue
+        diffs = np.linalg.norm(np.diff(nodes[seg], axis=0), axis=1)
+        seg_lengths.append(float(np.sum(diffs)))
+    total = float(np.sum(seg_lengths))
+    if total <= 1e-9:
+        return None
+    weights = np.array(seg_lengths) / total
+    # Discrete sample by weight.
+    r = float(rng.uniform(0.0, 1.0))
+    cum = 0.0
+    seg_id = 0
+    for i, w in enumerate(weights):
+        cum += float(w)
+        if r <= cum:
+            seg_id = i
+            break
+    seg = segments[seg_id]
+    if len(seg) < 2:
+        return None
+    # Pick edge: weighted by edge length within the segment.
+    edges = np.diff(nodes[seg], axis=0)
+    elens = np.linalg.norm(edges, axis=1)
+    if float(np.sum(elens)) < 1e-9:
+        return None
+    eweights = elens / float(np.sum(elens))
+    r2 = float(rng.uniform(0.0, 1.0))
+    cum = 0.0
+    edge_id = 0
+    for i, w in enumerate(eweights):
+        cum += float(w)
+        if r2 <= cum:
+            edge_id = i
+            break
+    a = seg[edge_id]
+    b = seg[edge_id + 1]
+    t = float(rng.uniform(interior_frac[0], interior_frac[1]))
+    p = nodes[a] * (1.0 - t) + nodes[b] * t
+    tangent = nodes[b] - nodes[a]
+    n = float(np.linalg.norm(tangent))
+    if n < 1e-12:
+        return None
+    return p.astype(np.float64), (tangent / n).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: foreground placement (hand-on-wire, gripper-on-wire, free-floating)
+# ---------------------------------------------------------------------------
+
+def _place_hand_on_wire(
+    obj: dict,
+    rng: np.random.RandomState,
+    skeleton_nodes: np.ndarray,
+    segments: list[list[int]],
+    n_keep: int | None = None,
+    extra_offset_max: float = 0.020,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Pose a graspable object (hand/gripper) so it grips a random wire point.
+
+    Returns ``None`` if the wire grasp picker fails (e.g. degenerate skeleton).
+
+    Procedure
+    ---------
+    1. Pick wire grasp point ``P`` and tangent ``T`` (random).
+    2. Apply per-object scale within ``natural_scale_range``.
+    3. Rotate so the object's ``grasp_axis_local`` aligns with ``T``.
+    4. Add a free random rotation about ``T`` (orientation around the wire).
+    5. Translate so the rotated centroid lands at ``P + small_offset``.
+       The small offset (uniform in a sphere of radius ``extra_offset_max``)
+       prevents perfect alignment so the hand reads as "grasping near" the
+       wire, not surgically tangent to it.
+    """
+    pick = _pick_wire_grasp_point(rng, skeleton_nodes, segments)
+    if pick is None:
+        return None
+    P, T = pick
+
+    base_pts = obj["points"].astype(np.float64).copy()
+    base_col = obj["colors"]
+    if n_keep is not None and n_keep < base_pts.shape[0]:
+        idx = rng.choice(base_pts.shape[0], size=n_keep, replace=False)
+        base_pts = base_pts[idx]
+        base_col = base_col[idx]
+
+    lo, hi = obj["natural_scale_range"]
+    scale = float(rng.uniform(lo, hi))
+    pts = base_pts * scale
+
+    grasp_axis = obj.get("grasp_axis_local")
+    if grasp_axis is None or np.allclose(grasp_axis, 0.0):
+        grasp_axis = np.array([1.0, 0.0, 0.0])
+    grasp_axis = np.asarray(grasp_axis, dtype=np.float64)
+
+    R_align = _rotation_align(grasp_axis, T)
+    extra_angle = float(rng.uniform(0.0, 2.0 * np.pi))
+    R_about = _rotation_about_axis(T, extra_angle)
+
+    pts_rot = pts @ R_align.T @ R_about.T
+
+    # Centroid of the rotated point cloud — the wire grasp point should pass
+    # through here.
+    grasp_centre = pts_rot.mean(axis=0)
+
+    # Tiny jitter so the hand isn't surgically perfect.
+    jitter = rng.normal(0.0, extra_offset_max / 3.0, size=3)
+    jitter_norm = float(np.linalg.norm(jitter))
+    if jitter_norm > extra_offset_max:
+        jitter = jitter * (extra_offset_max / jitter_norm)
+
+    pts_world = pts_rot - grasp_centre[None, :] + (P + jitter)[None, :]
+    return pts_world, base_col
+
+
+def _place_object_in_foreground(
+    obj: dict,
+    rng: np.random.RandomState,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    n_keep: int | None = None,
+    pad: float = 0.20,
+    tilt_deg: float = 25.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Place an object randomly in/near the harness bbox with random pose.
+
+    Foreground here is intentionally not view-dependent: the object is just
+    placed somewhere in the harness's spatial extent so that, depending on
+    view, it may occlude part of the harness, sit beside it, or peek into
+    frame from an edge.
+
+    The position is sampled from ``[bbox_min - pad, bbox_max + pad]`` along
+    each axis. ``tilt_deg`` bounds the random pitch / roll added to the
+    Y-axis spin (so the object isn't always axis-aligned).
+    """
+    base_pts = obj["points"].astype(np.float64).copy()
+    base_col = obj["colors"]
+    if n_keep is not None and n_keep < base_pts.shape[0]:
+        idx = rng.choice(base_pts.shape[0], size=n_keep, replace=False)
+        base_pts = base_pts[idx]
+        base_col = base_col[idx]
+
+    lo, hi = obj["natural_scale_range"]
+    scale = float(rng.uniform(lo, hi))
+    pts = base_pts * scale
+
+    theta_y = float(rng.uniform(0.0, 2.0 * np.pi))
+    theta_x = float(rng.uniform(-np.deg2rad(tilt_deg), np.deg2rad(tilt_deg)))
+    theta_z = float(rng.uniform(-np.deg2rad(tilt_deg), np.deg2rad(tilt_deg)))
+    R = (_rotation_about_axis(np.array([0.0, 1.0, 0.0]), theta_y)
+         @ _rotation_about_axis(np.array([1.0, 0.0, 0.0]), theta_x)
+         @ _rotation_about_axis(np.array([0.0, 0.0, 1.0]), theta_z))
+    pts_rot = pts @ R.T
+
+    pos = np.array([
+        rng.uniform(bbox_min[0] - pad, bbox_max[0] + pad),
+        rng.uniform(bbox_min[1] - pad, bbox_max[1] + pad),
+        rng.uniform(bbox_min[2] - pad, bbox_max[2] + pad),
+    ])
+    centroid = pts_rot.mean(axis=0)
+    pts_world = pts_rot - centroid[None, :] + pos[None, :]
+    return pts_world, base_col
+
+
+def generate_foreground_scene(
+    rng: np.random.RandomState,
+    object_library: list[dict],
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    skeleton_nodes: np.ndarray,
+    segments: list[list[int]],
+    n_points: int = 24000,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Generate foreground (occluding/near-harness) objects for one source.
+
+    Phase 8 v2: deterministic high-density placement, target 10-15 fg objects
+    per source (up from v1's 0-4). Composition mixes:
+
+    * **2-4 grasping objects** (hand or gripper gripping a random wire point).
+      Biased toward hands (70%) so skin is impossible-to-miss.
+    * **2-4 free-floating hands** (not grasping the wire). v2 spec requires
+      skin presence in EVERY source.
+    * **3-6 free-floating cables** (negative_wire_like). The wire-shaped
+      negatives the model has never seen.
+    * **1-3 free-floating grippers / arms / ropes** (other clutter).
+
+    Total typical: 8-17 objects, mean ~12. Ensures the user-required 10-15
+    foreground objects per sample.
+
+    Parameters
+    ----------
+    rng :
+        Source of randomness; same state → same scene.
+    object_library :
+        Output of :func:`load_object_library`. Empty → no foreground.
+    bbox_min, bbox_max :
+        Per-axis (3,) extent of the harness at rest pose.
+    skeleton_nodes, segments :
+        Wire skeleton at rest pose (or any chosen anim frame); used to pick
+        the grasp point + tangent for hand/gripper-on-wire poses.
+    n_points :
+        Soft total point budget for foreground (split across placed objects).
+
+    Returns
+    -------
+    fg_pcl : (M, 3) float64
+    fg_rgb : (M, 3) uint8 BGR
+    info : dict
+        Bookkeeping for the smoke test / log: ``placed`` is a list of
+        ``{"slug", "kind"}`` per object, ``n_points`` is the actual total
+        point count returned, ``counts`` summarises per-kind counts.
+    """
+    if not object_library or n_points <= 0:
+        return (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8),
+                {"placed": [], "n_points": 0,
+                 "counts": {"grasping": 0, "hand_free": 0,
+                             "cable": 0, "other": 0}})
+
+    hand_graspable = [o for o in object_library
+                       if o.get("category") == "hand"
+                       and o.get("graspable_on_wire")]
+    gripper_graspable = [o for o in object_library
+                          if o.get("category") in ("gripper", "arm")
+                          and o.get("graspable_on_wire")]
+    hand_pool = [o for o in object_library if o.get("category") == "hand"]
+    cable_pool = [o for o in object_library
+                   if o.get("category") == "negative_wire_like"]
+    other_pool = [o for o in object_library
+                   if o.get("category") in ("gripper", "arm", "rope")]
+
+    n_grasp = int(rng.randint(2, 5))         # 2..4
+    n_hand_free = int(rng.randint(2, 5))      # 2..4
+    n_cables_fg = int(rng.randint(3, 7))      # 3..6
+    n_other = int(rng.randint(1, 4))          # 1..3
+
+    total_items = n_grasp + n_hand_free + n_cables_fg + n_other
+    if total_items == 0:
+        return (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8),
+                {"placed": [], "n_points": 0,
+                 "counts": {"grasping": 0, "hand_free": 0,
+                             "cable": 0, "other": 0}})
+
+    n_keep_per = max(256, n_points // total_items)
+
+    pieces_pts: list[np.ndarray] = []
+    pieces_rgb: list[np.ndarray] = []
+    info: dict = {"placed": [],
+                  "counts": {"grasping": 0, "hand_free": 0,
+                              "cable": 0, "other": 0}}
+
+    # Grasping: ≥1 if any graspable available; bias toward hands so skin
+    # is dense in the foreground.
+    placed_grasp = 0
+    for _ in range(n_grasp):
+        if hand_graspable and rng.uniform(0.0, 1.0) < 0.7:
+            obj = hand_graspable[rng.randint(0, len(hand_graspable))]
+        elif gripper_graspable:
+            obj = gripper_graspable[rng.randint(0, len(gripper_graspable))]
+        elif hand_graspable:
+            obj = hand_graspable[rng.randint(0, len(hand_graspable))]
+        else:
+            continue
+        result = _place_hand_on_wire(
+            obj=obj, rng=rng,
+            skeleton_nodes=skeleton_nodes, segments=segments,
+            n_keep=n_keep_per,
+        )
+        if result is None:
+            continue
+        pts, rgb = result
+        pieces_pts.append(pts)
+        pieces_rgb.append(rgb)
+        info["placed"].append({"slug": obj["slug"], "kind": "grasping"})
+        placed_grasp += 1
+    info["counts"]["grasping"] = placed_grasp
+
+    # Free-floating hands (not grasping). Always present per spec.
+    placed_hf = 0
+    for _ in range(n_hand_free):
+        if not hand_pool:
+            break
+        obj = hand_pool[rng.randint(0, len(hand_pool))]
+        pts, rgb = _place_object_in_foreground(
+            obj=obj, rng=rng,
+            bbox_min=bbox_min, bbox_max=bbox_max,
+            n_keep=n_keep_per,
+        )
+        pieces_pts.append(pts)
+        pieces_rgb.append(rgb)
+        info["placed"].append({"slug": obj["slug"], "kind": "hand_free"})
+        placed_hf += 1
+    info["counts"]["hand_free"] = placed_hf
+
+    # Free-floating cables (wire-shaped negatives).
+    placed_cable = 0
+    for _ in range(n_cables_fg):
+        if not cable_pool:
+            break
+        obj = cable_pool[rng.randint(0, len(cable_pool))]
+        pts, rgb = _place_object_in_foreground(
+            obj=obj, rng=rng,
+            bbox_min=bbox_min, bbox_max=bbox_max,
+            n_keep=n_keep_per,
+        )
+        pieces_pts.append(pts)
+        pieces_rgb.append(rgb)
+        info["placed"].append({"slug": obj["slug"], "kind": "cable"})
+        placed_cable += 1
+    info["counts"]["cable"] = placed_cable
+
+    # Other clutter (grippers, arms, ropes).
+    placed_other = 0
+    for _ in range(n_other):
+        if not other_pool:
+            break
+        obj = other_pool[rng.randint(0, len(other_pool))]
+        pts, rgb = _place_object_in_foreground(
+            obj=obj, rng=rng,
+            bbox_min=bbox_min, bbox_max=bbox_max,
+            n_keep=n_keep_per,
+        )
+        pieces_pts.append(pts)
+        pieces_rgb.append(rgb)
+        info["placed"].append({"slug": obj["slug"], "kind": "other"})
+        placed_other += 1
+    info["counts"]["other"] = placed_other
+
+    if not pieces_pts:
+        info["n_points"] = 0
+        return (np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8), info)
+
+    pts_all = np.concatenate(pieces_pts, axis=0)
+    rgb_all = np.concatenate(pieces_rgb, axis=0)
+    info["n_points"] = int(pts_all.shape[0])
+    info["n_objects"] = len(info["placed"])
+    return pts_all, rgb_all, info
+
+
+# ---------------------------------------------------------------------------
+# (continued: _pick_clutter_position lives below)
+# ---------------------------------------------------------------------------
 
 def _pick_clutter_position(
     rng: np.random.RandomState,
@@ -743,6 +1196,15 @@ def _place_object_on_floor(
     return pts_world, base_col
 
 
+#: Categories that should NEVER be placed as floor-level background clutter.
+#: Hands/grippers/arms/cables are foreground objects: they only appear via
+#: :func:`generate_foreground_scene`. Putting a hand on the floor as bg
+#: clutter would imply detached hands lying around — visually wrong.
+_FOREGROUND_ONLY_CATEGORIES: frozenset = frozenset({
+    "hand", "gripper", "arm", "negative_wire_like",
+})
+
+
 def generate_background_scene(
     rng: np.random.RandomState,
     bbox_min: np.ndarray,
@@ -803,13 +1265,20 @@ def generate_background_scene(
         max(bbox_max[0] - bbox_min[0], bbox_max[2] - bbox_min[2]) * 0.5 + 0.6,
     ))
 
-    obj_lib = object_library or []
+    # Filter out foreground-only categories (hand/gripper/arm/cable). These
+    # objects belong to ``generate_foreground_scene`` and should never become
+    # detached "lying on the floor" clutter.
+    obj_lib = [
+        o for o in (object_library or [])
+        if o.get("category") not in _FOREGROUND_ONLY_CATEGORIES
+    ]
 
-    # Choose 3-5 objects (with replacement is fine — repeats look like real
-    # clutter where a workshop has multiple copies of similar items).
+    # Phase 8 v2: 10-15 objects scattered across the floor, up from v1's 3-6.
+    # User's spec asks for "extreme clutter". With replacement is fine —
+    # repeats look like real clutter.
     chosen: list[dict] = []
     if obj_lib:
-        n_pick = int(rng.randint(3, 6))  # 3, 4, or 5
+        n_pick = int(rng.randint(10, 16))  # 10..15
         chosen = [obj_lib[rng.randint(0, len(obj_lib))] for _ in range(n_pick)]
 
     total_obj_available = sum(o["points"].shape[0] for o in chosen)

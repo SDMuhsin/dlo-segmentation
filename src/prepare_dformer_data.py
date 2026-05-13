@@ -38,7 +38,7 @@ from tqdm import tqdm
 SRC_ROOT = Path("data/rgbd_videos")
 DST_ROOT = Path("data/dformer_dataset")
 VIEWS = ["front", "back", "left", "right", "top", "bottom"]
-SRC_FRAME_STEP = 5      # every 5th source frame
+SRC_FRAME_STEP = 5      # every 5th source frame (Phase 4 default)
 ANIM_FRAME = 0           # only anim frame 0
 DEPTH_MIN_MM = 500
 DEPTH_MAX_MM = 1500
