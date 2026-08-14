@@ -1,0 +1,322 @@
+{
+  "description": "Phase 4 background clutter: 21 CC0 mesh-derived coloured point clouds from Poly Haven, normalised to a local frame (centred X/Z, lowest Y at 0, longest extent = 1). Kept in the repo because they were sampled from the source meshes and there is no download for the sampled form. Poly Haven assets are CC0.",
+  "total": 21,
+  "license_summary": "CC0 (public domain) from Poly Haven. No attribution required.",
+  "objects": [
+    {
+      "slug": "Drill_01",
+      "file": "Drill_01.npz",
+      "category": "tool",
+      "description": "Cordless drill with lime plastic body, black rubber grip and metal chuck.",
+      "source_url": "https://polyhaven.com/a/Drill_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.2,
+      "natural_scale_range": [
+        0.14,
+        0.26
+      ]
+    },
+    {
+      "slug": "cardboard_box_01",
+      "file": "cardboard_box_01.npz",
+      "category": "container",
+      "description": "Worn cardboard shipping box.",
+      "source_url": "https://polyhaven.com/a/cardboard_box_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.38,
+      "natural_scale_range": [
+        0.266,
+        0.494
+      ]
+    },
+    {
+      "slug": "metal_toolbox",
+      "file": "metal_toolbox.npz",
+      "category": "container",
+      "description": "Red metal toolbox with steel handle and latches.",
+      "source_url": "https://polyhaven.com/a/metal_toolbox",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.36,
+      "natural_scale_range": [
+        0.252,
+        0.468
+      ]
+    },
+    {
+      "slug": "Lantern_01",
+      "file": "Lantern_01.npz",
+      "category": "lighting",
+      "description": "Vintage tin lantern with glass panes and wire handle.",
+      "source_url": "https://polyhaven.com/a/Lantern_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.28,
+      "natural_scale_range": [
+        0.196,
+        0.364
+      ]
+    },
+    {
+      "slug": "desk_lamp_arm_01",
+      "file": "desk_lamp_arm_01.npz",
+      "category": "lighting",
+      "description": "Articulated desk lamp with metal arm and conical shade.",
+      "source_url": "https://polyhaven.com/a/desk_lamp_arm_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.5,
+      "natural_scale_range": [
+        0.35,
+        0.65
+      ]
+    },
+    {
+      "slug": "Camera_01",
+      "file": "Camera_01.npz",
+      "category": "electronics",
+      "description": "Vintage box-style camera with leather wrap and brass dials.",
+      "source_url": "https://polyhaven.com/a/Camera_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.22,
+      "natural_scale_range": [
+        0.154,
+        0.286
+      ]
+    },
+    {
+      "slug": "cassette_player",
+      "file": "cassette_player.npz",
+      "category": "electronics",
+      "description": "Portable cassette player with chrome buttons.",
+      "source_url": "https://polyhaven.com/a/cassette_player",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.24,
+      "natural_scale_range": [
+        0.168,
+        0.312
+      ]
+    },
+    {
+      "slug": "portable_cassette_player",
+      "file": "portable_cassette_player.npz",
+      "category": "electronics",
+      "description": "Compact portable cassette player.",
+      "source_url": "https://polyhaven.com/a/portable_cassette_player",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.2,
+      "natural_scale_range": [
+        0.14,
+        0.26
+      ]
+    },
+    {
+      "slug": "plastic_thermos",
+      "file": "plastic_thermos.npz",
+      "category": "container",
+      "description": "Plastic thermos flask with handle and screw cap.",
+      "source_url": "https://polyhaven.com/a/plastic_thermos",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.25,
+      "natural_scale_range": [
+        0.175,
+        0.325
+      ]
+    },
+    {
+      "slug": "ceramic_vase_02",
+      "file": "ceramic_vase_02.npz",
+      "category": "decor",
+      "description": "Glazed ceramic vase, neutral tones with subtle highlights.",
+      "source_url": "https://polyhaven.com/a/ceramic_vase_02",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.3,
+      "natural_scale_range": [
+        0.21,
+        0.39
+      ]
+    },
+    {
+      "slug": "brass_pot_01",
+      "file": "brass_pot_01.npz",
+      "category": "kitchenware",
+      "description": "Polished brass pot with handle and round body.",
+      "source_url": "https://polyhaven.com/a/brass_pot_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.28,
+      "natural_scale_range": [
+        0.196,
+        0.364
+      ]
+    },
+    {
+      "slug": "wooden_crate_02",
+      "file": "wooden_crate_02.npz",
+      "category": "container",
+      "description": "Slatted wooden crate with stencil markings.",
+      "source_url": "https://polyhaven.com/a/wooden_crate_02",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.45,
+      "natural_scale_range": [
+        0.315,
+        0.585
+      ]
+    },
+    {
+      "slug": "flathead_screwdriver",
+      "file": "flathead_screwdriver.npz",
+      "category": "tool",
+      "description": "Flathead screwdriver with red plastic handle.",
+      "source_url": "https://polyhaven.com/a/flathead_screwdriver",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.22,
+      "natural_scale_range": [
+        0.154,
+        0.286
+      ]
+    },
+    {
+      "slug": "hatchet",
+      "file": "hatchet.npz",
+      "category": "tool",
+      "description": "Wood-handled hatchet with steel head.",
+      "source_url": "https://polyhaven.com/a/hatchet",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.28,
+      "natural_scale_range": [
+        0.196,
+        0.364
+      ]
+    },
+    {
+      "slug": "metal_jerrycan",
+      "file": "metal_jerrycan.npz",
+      "category": "container",
+      "description": "Metal jerrycan with screw cap and stamped panels.",
+      "source_url": "https://polyhaven.com/a/metal_jerrycan",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.4,
+      "natural_scale_range": [
+        0.28,
+        0.52
+      ]
+    },
+    {
+      "slug": "plastic_jerrycan",
+      "file": "plastic_jerrycan.npz",
+      "category": "container",
+      "description": "Plastic jerrycan with curved spout and cap.",
+      "source_url": "https://polyhaven.com/a/plastic_jerrycan",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.3,
+      "natural_scale_range": [
+        0.21,
+        0.39
+      ]
+    },
+    {
+      "slug": "can_rusted",
+      "file": "can_rusted.npz",
+      "category": "container",
+      "description": "Small rusted tin can.",
+      "source_url": "https://polyhaven.com/a/can_rusted",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.13,
+      "natural_scale_range": [
+        0.091,
+        0.169
+      ]
+    },
+    {
+      "slug": "Television_01",
+      "file": "Television_01.npz",
+      "category": "electronics",
+      "description": "Vintage CRT television with wooden housing and dials.",
+      "source_url": "https://polyhaven.com/a/Television_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.55,
+      "natural_scale_range": [
+        0.385,
+        0.715
+      ]
+    },
+    {
+      "slug": "WetFloorSign_01",
+      "file": "WetFloorSign_01.npz",
+      "category": "signage",
+      "description": "Yellow wet-floor caution sign.",
+      "source_url": "https://polyhaven.com/a/WetFloorSign_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.55,
+      "natural_scale_range": [
+        0.385,
+        0.715
+      ]
+    },
+    {
+      "slug": "CashRegister_01",
+      "file": "CashRegister_01.npz",
+      "category": "appliance",
+      "description": "Vintage mechanical cash register with brass keys.",
+      "source_url": "https://polyhaven.com/a/CashRegister_01",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.55,
+      "natural_scale_range": [
+        0.385,
+        0.715
+      ]
+    },
+    {
+      "slug": "brass_blowtorch",
+      "file": "brass_blowtorch.npz",
+      "category": "tool",
+      "description": "Brass blowtorch with reservoir and burner head.",
+      "source_url": "https://polyhaven.com/a/brass_blowtorch",
+      "license": "CC0",
+      "source": "Poly Haven",
+      "n_points": 8000,
+      "natural_scale_units": 0.24,
+      "natural_scale_range": [
+        0.168,
+        0.312
+      ]
+    }
+  ]
+}
