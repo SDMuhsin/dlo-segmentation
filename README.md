@@ -27,6 +27,38 @@ Two training-side changes; the dataset is the same one used for the July numbers
 2. Scale augmentation (`--aug-zoom 0.5,0.5,1.0`). With p=0.5, crop a random [0.5, 1.0]
    fraction and resize back, so connectors appear at up to twice their normal size.
 
+## Late August: pasting real photographs into the renders
+
+The numbers above are synthetic. A first check on camera footage showed the connector
+class does not carry over, so three arms tried adding real photographs to the rendered
+training images. Connector photographs came from Wikimedia Commons, cable photographs
+from the MovingCables dataset.
+
+| Arm | What is pasted, and as which class | Mean IoU | Wire pixels on camera footage |
+|---|---|---|---|
+| baseline | nothing | 0.8929 | 6.3% |
+| A | connector photos as connector | 0.8919 | 2.0% |
+| B | A, plus object photos as background | 0.8884 | 0.8% |
+| C | B, plus cable photos as wire | 0.8890 | 2.9% |
+
+All three are rejected. Synthetic validation moves by under half a point across every
+arm and is blind to the failure.
+
+In arms A and B no photographic pixel was ever labelled wire, so the model learned that
+photographic texture means "not wire". On camera footage every pixel is photographic, so
+the wire disappeared. Arm C gave every class photographic pixels and confirmed the
+diagnosis, with the fraction of real cable predicted wire rising from 0.02 to 0.97, but
+camera footage recovered only to 2.9%. The residual failure is scale: pastes were sized
+well above the rendered connector distribution, so large photographic regions such as
+bottles and paper read as connector.
+
+Build a paste set with `src/composite_connector_positives.py`, assemble the arm 1:1
+against the base dataset with `src/build_p44_connpaste_dataset.py`, check it with
+`src/validate_p44_composites.py`, and train with
+`scripts/train_3way_p44_connpaste.sh`. `src/probe_p44_texture_cue.py` and
+`src/probe_p44_wire_cue.py` measure the shortcut directly; both carry a matched control,
+without which "the model stopped firing" cannot be told apart from a broken probe.
+
 ## Setup
 
 ```bash
@@ -185,6 +217,15 @@ src/                 rendering, dataset building, training, evaluation, analysis
   eval_3way_final.py         three-way evaluation, per-set breakdown, TTA
   diag_3way_connector_ceiling.py
                              error decomposition: confusion, rim bands, blob size vs recall
+  composite_connector_positives.py
+                             paste real photo cutouts into rendered frames as labelled
+                             connector, background or wire
+  export_wire_cutouts_mc.py  cut real cable strands out of MovingCables using its masks
+  build_p44_connpaste_dataset.py / validate_p44_composites.py
+                             assemble a paste arm 1:1 against the base set, and its
+                             pre-flight checks
+  probe_p44_texture_cue.py / probe_p44_wire_cue.py / probe_p44_stage_ablation.py
+                             measure whether the model keys on photographic texture
 scripts/             asset download and training launchers
 sbatch/              SLURM job scripts
 assets/              small CC0 inputs that cannot be re-downloaded
