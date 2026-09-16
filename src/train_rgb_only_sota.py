@@ -44,6 +44,7 @@ import os
 import random
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -66,7 +67,13 @@ os.environ.setdefault("TRANSFORMERS_CACHE", HF_CACHE)
 
 # Reuse the cache builder from the 5-class teacher script.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 from train_rgbd_seg import build_cache  # noqa: E402
+from dataset_generation.realworld_dataset import (  # noqa: E402
+    ElectricWiresDataset,
+    _find_split_dirs,
+    _pair_images_and_masks,
+)
 
 from transformers import SegformerForSemanticSegmentation  # noqa: E402
 
@@ -1420,6 +1427,16 @@ def parse_args():
     p.add_argument("--backbone", default=BACKBONE_DEFAULT,
                    help="HuggingFace backbone id (e.g. nvidia/mit-b5, nvidia/mit-b4, nvidia/mit-b3)")
     p.add_argument("--data-dir", default=DATASET_DIR_DEFAULT)
+    p.add_argument(
+        "--dataset-format",
+        choices=("cdlo", "electric-wires"),
+        default="cdlo",
+        help=(
+            "Dataset input format. 'cdlo' preserves the existing synthetic/cache "
+            "pipeline; 'electric-wires' uses the realistic Electric Wires RGB "
+            "binary segmentation dataset."
+        ),
+    )
     p.add_argument("--smoke", choices=list(SMOKE_PRESETS), default=None)
     p.add_argument("--limit-sets", type=int, default=None)
     p.add_argument("--time-budget", type=float, default=None)
@@ -1453,7 +1470,108 @@ def setup_distributed(single_gpu):
     return False, 0, 0, 1
 
 
+class ElectricWiresTrainerAdapter(Dataset):
+    """Adapt Noor's ElectricWiresDataset to this trainer's batch contract.
+
+    ElectricWiresDataset returns:
+        image: float32 (3,H,W), range [0,1]
+        mask:  float32 (1,H,W), values {0,1}
+
+    The existing trainer expects:
+        rgb:   uint8 (3,H,W), range [0,255]
+        label: int64 (H,W), values {0,1}
+    """
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+
+        rgb = (
+            sample["image"]
+            .mul(255.0)
+            .round()
+            .clamp(0, 255)
+            .to(torch.uint8)
+        )
+
+        label = sample["mask"].squeeze(0).to(torch.int64)
+
+        return {"rgb": rgb, "label": label}
+
+
+def build_electric_wires_dataset(args, rank):
+    if args.num_classes != 2:
+        raise ValueError(
+            "Electric Wires training is binary; use --num-classes 2."
+        )
+
+    root = Path(args.data_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Electric Wires data directory not found: {root}")
+
+    splits = _find_split_dirs(root)
+
+    if "train" not in splits:
+        raise RuntimeError(
+            f"No train split found under Electric Wires dataset root: {root}"
+        )
+
+    val_key = (
+        "test" if "test" in splits
+        else "val" if "val" in splits
+        else "valid" if "valid" in splits
+        else None
+    )
+    if val_key is None:
+        raise RuntimeError(
+            "No test/val/valid split found for Electric Wires dataset."
+        )
+
+    train_pairs = _pair_images_and_masks(splits["train"])
+    val_pairs = _pair_images_and_masks(splits[val_key])
+
+    if not train_pairs:
+        raise RuntimeError("Electric Wires train split contains no matched pairs.")
+    if not val_pairs:
+        raise RuntimeError(
+            f"Electric Wires {val_key} split contains no matched pairs."
+        )
+
+    # Keep the established trainer resolution so model output, labels, and
+    # existing evaluation code remain directly comparable.
+    train_base = ElectricWiresDataset(
+        train_pairs,
+        image_size=(IMAGE_H, IMAGE_W),
+        augment=True,
+    )
+    val_base = ElectricWiresDataset(
+        val_pairs,
+        image_size=(IMAGE_H, IMAGE_W),
+        augment=False,
+    )
+
+    if rank == 0:
+        print("Electric Wires dataset:")
+        print(f"  Train: {len(train_base)} images")
+        print(f"  Val ({val_key}): {len(val_base)} images")
+        print(f"  Resolution: {IMAGE_H}x{IMAGE_W}")
+        print("  Classes: 0=background, 1=wire")
+
+    return (
+        ElectricWiresTrainerAdapter(train_base),
+        ElectricWiresTrainerAdapter(val_base),
+    )
+
+
 def build_dataset(args, rank, world_size):
+    if args.dataset_format == "electric-wires":
+        return build_electric_wires_dataset(args, rank)
+
     train_rgb, _, train_label = build_cache(args.data_dir, "train")
     val_rgb, _, val_label = build_cache(args.data_dir, "val")
 
