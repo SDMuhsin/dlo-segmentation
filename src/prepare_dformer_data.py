@@ -92,6 +92,11 @@ def parse_args():
                         "Phase 7 trained on every 5th source so pass --src-frame-step 5. "
                         "Phase 9/11 are pre-strided at render time (60 src/set) so "
                         "keep the default of 1.")
+    p.add_argument("--include-zoom", action="store_true",
+                   help="Also stage the connector-insertion zoom views "
+                        "({src}_{anim}_zoom{j}, listed in metadata.json 'zoom_views'). "
+                        "Default off: staging is unchanged. A source without a connector "
+                        "slot has no zoom files; those are skipped silently.")
     return p.parse_args()
 
 
@@ -135,6 +140,12 @@ def main():
         VIEWS = VIEWS_DEFAULT_PHASE9.copy()
     else:
         VIEWS = VIEWS_DEFAULT_LEGACY.copy()
+    zoom_names = []
+    if args.include_zoom:
+        zoom_names = list(meta.get("zoom_views", {}).get("names", []))
+        if not zoom_names:
+            print("  WARNING: --include-zoom but metadata.json has no 'zoom_views'")
+        VIEWS = VIEWS + zoom_names
     print(f"  Views: {VIEWS}")
     print(f"  src-root      = {src_root}")
     print(f"  dst-root      = {dst_root}")
@@ -173,6 +184,8 @@ def main():
                     src_label = src_root / split_name / set_id / label_source / f"{fname}.png"
 
                     if not src_rgb.exists():
+                        if view in zoom_names:
+                            continue
                         print(f"  WARNING: missing {src_rgb}")
                         continue
                     if not src_label.exists():

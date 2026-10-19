@@ -21,6 +21,11 @@ import cv2
 import numpy as np
 from scipy.spatial import KDTree
 
+# 3D connector insertion (src/connector_insertion/, default OFF): points the
+# planner inserts carry this dedicated label. Imported (not redefined) so the
+# planner and the rasteriser can never disagree on the value.
+from connector_insertion.constants import INSERTED_CONNECTOR_LABEL
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -161,6 +166,13 @@ P26_SURFACE_SHADOW_BLUR = float(_p26_flag("KIAT_P26_SURFACE_SHADOW_BLUR", "9.0")
 #       run-width (disc radius derived from the base ``SPLAT_RADIUS`` cross).
 CONNECTOR_SCALE = float(_p26_flag("KIAT_CONNECTOR_SCALE", "1.0"))
 
+# KIAT_CONNINS_USE_CONNECTOR_DISC (default 0): inserted 3D-connector points
+# (INSERTED_CONNECTOR_LABEL) splat with the BASE footprint so the fine model
+# detail (pins, seams) survives. "1" gives them the same enlarged
+# KIAT_CONNECTOR_SCALE disc source class-3 points get (no-op if scale <= 1).
+INSERTED_CONNECTOR_USE_DISC = os.environ.get(
+    "KIAT_CONNINS_USE_CONNECTOR_DISC", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Class colors (BGR for OpenCV)
 CLASS_COLORS_RGB = {
     0: (180, 180, 180),  # Wire - gray
@@ -284,9 +296,77 @@ def pixel_to_cam_xy(u, v):
     return cx, cy
 
 
+#: Zoomed rasterisation splats with a vectorised first-writer-wins z-buffer
+#: (identical output to the per-point loop; set False to use the loop, e.g. in tests).
+ZOOM_VECTORISED = True
+
+
+def _splat_vectorised(order, u_int, v_int, depth_vals, pr, tables, label_out,
+                      labels, point_rgb, zbuf, depth_img, color_img, label_img,
+                      max_frag=6_000_000):
+    """Vectorised equivalent of the per-point z-buffered splat loop.
+
+    ``order`` is depth-sorted (stable). A pixel is won by the fragment with the
+    smallest (depth, position in ``order``): exactly the first writer under the
+    strict ``d < zbuf`` test of the loop. Keys pack (pixel, depth, rank) in int64.
+    """
+    n = len(order)
+    if n == 0:
+        return
+    rank_bits = 24
+    assert n < (1 << rank_bits)
+    pr_o = pr[order]
+    winners = []
+    for r, tab in tables.items():
+        sel = np.where(pr_o == r)[0]
+        chunk = max(1, max_frag // len(tab))
+        for c0 in range(0, len(sel), chunk):
+            rk = sel[c0:c0 + chunk]
+            idx = order[rk]
+            us = u_int[idx][:, None] + tab[:, 0][None, :]
+            vs = v_int[idx][:, None] + tab[:, 1][None, :]
+            m = (us >= 0) & (us < IMG_W) & (vs >= 0) & (vs < IMG_H)
+            pix = (vs * IMG_W + us).astype(np.int64)
+            low = (depth_vals[idx].astype(np.int64) << rank_bits) | rk.astype(np.int64)
+            key = (pix << 40) | low[:, None]
+            key = np.sort(key[m])
+            if key.size:
+                pk = key >> 40
+                first = np.empty(key.size, dtype=bool)
+                first[0] = True
+                first[1:] = pk[1:] != pk[:-1]
+                winners.append(key[first])
+    if not winners:
+        return
+    allk = np.sort(np.concatenate(winners))
+    pk = allk >> 40
+    first = np.empty(allk.size, dtype=bool)
+    first[0] = True
+    first[1:] = pk[1:] != pk[:-1]
+    win = allk[first]
+    pix = win >> 40
+    idx = order[win & ((1 << rank_bits) - 1)]
+    vv, uu = pix // IMG_W, pix % IMG_W
+    d = depth_vals[idx]
+    ok = d < zbuf[vv, uu]
+    vv, uu, idx, d = vv[ok], uu[ok], idx[ok], d[ok]
+    zbuf[vv, uu] = d
+    depth_img[vv, uu] = d
+    if point_rgb is not None:
+        color_img[vv, uu] = np.asarray(point_rgb)[idx]
+    else:
+        cols = np.empty((len(idx), 3), dtype=np.uint8)
+        lb = np.asarray(labels)[idx]
+        for lv in np.unique(lb):
+            cols[lb == lv] = CLASS_COLORS_BGR.get(int(lv), (128, 128, 128))
+        color_img[vv, uu] = cols
+    label_img[vv, uu] = label_out[idx]
+
+
 # ── Rasterizer ───────────────────────────────────────────────────────────────
 
-def rasterize_view(points, labels, R, point_rgb=None, background=None):
+def rasterize_view(points, labels, R, point_rgb=None, background=None,
+                   zoom=1.0, centre=None, point_radius=None):
     """Render one orthographic view with z-buffered point splatting.
 
     Args:
@@ -301,6 +381,20 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
             Note: depth_img and label_img are still bg-zeroed (background has
             no depth and is not part of any class). The morphological-closing
             fill is unaffected.
+        zoom, centre, point_radius: connector-insertion "zoom views" (all
+            default to an exact no-op: with ``zoom == 1.0``, ``centre is None``
+            and ``point_radius is None`` the legacy code path runs unchanged).
+            ``zoom`` multiplies pixels-per-unit (``SCALE * zoom``) and
+            ``centre`` = (cx, cy) is the camera-plane point (world units,
+            camera right / down axes) that maps to the image centre. The depth
+            encoding (cam_z -> mm) is independent of both. In the zoomed path
+            points are depth-sorted STABLY, culled to the window (with a splat
+            margin) before the per-point loop, and splat with radius
+            ``max(SPLAT_RADIUS, ceil(zoom))``, except inserted connector points
+            (``INSERTED_CONNECTOR_LABEL``), which keep ``SPLAT_RADIUS``. An
+            optional ``point_radius`` ((N,) ints) overrides the per-point
+            radius. KIAT_CONNECTOR_SCALE discs are not applied when zoomed, and
+            the soft-edge wire pass (KIAT_P26_SOFTEDGE) is unsupported there.
 
     Returns:
         color_img: (H, W, 3) uint8 BGR image
@@ -312,7 +406,18 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
             separates harness from environment.
     """
     cam = project_ortho(points, R)
-    u_f, v_f = cam_to_pixel(cam[:, :2])
+    legacy_geom = (zoom == 1.0 and centre is None and point_radius is None)
+    if legacy_geom:
+        u_f, v_f = cam_to_pixel(cam[:, :2])
+    else:
+        if P26_SOFTEDGE:
+            raise NotImplementedError(
+                "rasterize_view zoom/centre/point_radius with KIAT_P26_SOFTEDGE=1 "
+                "is not supported")
+        cx_, cy_ = (0.0, 0.0) if centre is None else (float(centre[0]), float(centre[1]))
+        sc_ = SCALE * float(zoom)
+        u_f = (cam[:, 0] - cx_) * sc_ + IMG_W / 2.0
+        v_f = (cam[:, 1] - cy_) * sc_ + IMG_H / 2.0
     depth_vals = depth_to_uint16(cam[:, 2])
 
     # Frustum cull: points whose camera-space Z falls outside the depth range
@@ -327,6 +432,9 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
     label_out = np.zeros(labels_arr.shape[0], dtype=np.uint8)
     valid = (labels_arr >= 0) & (labels_arr <= 4)
     label_out[valid] = labels_arr[valid].astype(np.uint8) + np.uint8(1)
+    # Inserted 3D connector points (source class 3 equivalent -> png label 4).
+    # Without this line they would fall in the "unknown -> 0" bucket above.
+    label_out[labels_arr == INSERTED_CONNECTOR_LABEL] = np.uint8(4)
 
     # ── Phase 26.0: split off the WIRE layer (harness class 0 → label_out==1).
     # When the lever is OFF, ``wire_pt`` is the all-False default so the rest of
@@ -370,8 +478,33 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
         order = nonwire[np.argsort(depth_vals[nonwire], kind="stable")]
         order = order[in_frustum[order]]
     else:
-        order = np.argsort(depth_vals)
+        # Legacy path keeps the default (unstable) sort for byte identity; the
+        # zoomed path sorts stably so culling to a window cannot reorder ties.
+        order = np.argsort(depth_vals, kind=("quicksort" if legacy_geom else "stable"))
         order = order[in_frustum[order]]
+
+    # Zoomed path: per-point splat radius + window cull (before the Python loop).
+    zoom_tables = None
+    if not legacy_geom:
+        if point_radius is not None:
+            pr_ = np.asarray(point_radius).astype(np.int32)
+            if pr_.shape != (labels_arr.shape[0],):
+                raise ValueError("point_radius must have shape (N,)")
+        else:
+            r_bg_ = max(SPLAT_RADIUS, int(np.ceil(float(zoom) - 1e-9)))
+            pr_ = np.full(labels_arr.shape[0], r_bg_, dtype=np.int32)
+            pr_[labels_arr == INSERTED_CONNECTOR_LABEL] = SPLAT_RADIUS
+        zoom_tables = {}
+        for rr in np.unique(pr_[order]) if order.size else []:
+            rr = int(rr)
+            zoom_tables[rr] = np.array(
+                [(dx, dy) for dy in range(-rr, rr + 1) for dx in range(-rr, rr + 1)
+                 if dx * dx + dy * dy <= rr * rr], dtype=np.int32)
+        if order.size:
+            rm_ = int(pr_[order].max()) + 1
+            win_ = ((u_f >= -rm_) & (u_f < IMG_W + rm_)
+                    & (v_f >= -rm_) & (v_f < IMG_H + rm_))
+            order = order[win_[order]]
 
     # Precompute splat offsets
     r = SPLAT_RADIUS
@@ -403,6 +536,11 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
     u_int = np.round(u_f).astype(np.int32)
     v_int = np.round(v_f).astype(np.int32)
 
+    if zoom_tables is not None and ZOOM_VECTORISED:
+        _splat_vectorised(order, u_int, v_int, depth_vals, pr_, zoom_tables, label_out,
+                          labels_arr, point_rgb, zbuf, depth_img, color_img, label_img)
+        order = order[:0]
+
     for idx in order:
         cu, cv = u_int[idx], v_int[idx]
         d = depth_vals[idx]
@@ -417,8 +555,14 @@ def rasterize_view(points, labels, R, point_rgb=None, background=None):
         # — and the entire OFF path — uses the unchanged base ``offsets``, so
         # the connector blob's added pixels carry the connector label, colour,
         # and depth via the very same z-buffered write below (stay aligned).
-        off = (conn_offsets if (CONNECTOR_SCALE > 1.0 and int(lbl) == 3)
+        # Inserted 3D-connector points use the enlarged disc only when asked
+        # (INSERTED_CONNECTOR_USE_DISC); by default they splat with ``offsets``.
+        off = (conn_offsets if (CONNECTOR_SCALE > 1.0 and (
+                   int(lbl) == 3 or (INSERTED_CONNECTOR_USE_DISC
+                                     and int(lbl) == INSERTED_CONNECTOR_LABEL)))
                else offsets)
+        if zoom_tables is not None:
+            off = zoom_tables[int(pr_[idx])]
         us = cu + off[:, 0]
         vs = cv + off[:, 1]
 

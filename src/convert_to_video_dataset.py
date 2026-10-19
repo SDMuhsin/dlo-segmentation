@@ -379,6 +379,35 @@ from texture_mapping import (
     sample_light_direction,
 )
 
+# ── 3D connector insertion (src/connector_insertion/, default OFF) ──────────
+# Master switch KIAT_CONNINS=1 (+ KIAT_CONNINS_* knobs, see that package's
+# README). When ON, the harness connector points (source class 3) are replaced
+# AFTER texturing and BEFORE rasterisation by real 3D connector models (GLB ->
+# coloured point clouds). Planner RNG = RandomState(set_id*1000 + frame_id +
+# 733), separate from every stream above and drawn ONLY when enabled, so the
+# OFF path consumes nothing and stays byte-identical. Static renders only
+# (num_frames == 1: phase9/11/12/13 + ablations); animated v2 raises.
+from connector_insertion import ConnectorInsertionConfig, ConnectorLibrary, plan_connector_insertion
+from connector_insertion.insert import make_rng as _connins_make_rng
+from connector_insertion.zoom import (
+    ZoomRenderer as _ConnInsZoomRenderer, plan_zoom_views as _connins_plan_zoom,
+    zoom_view_name as _connins_zoom_name)
+CONNINS_CFG = ConnectorInsertionConfig.from_env()
+_CONNINS_LIB_CACHE = None
+def _get_connins_library():
+    """Lazy per-worker library (npz files are small; loaded once per process)."""
+    global _CONNINS_LIB_CACHE
+    if _CONNINS_LIB_CACHE is None:
+        lib_dir = Path(CONNINS_CFG.library_dir)
+        if not lib_dir.is_absolute():
+            lib_dir = PROJECT_ROOT / lib_dir
+        _CONNINS_LIB_CACHE = ConnectorLibrary.load(lib_dir)
+        if CONNINS_CFG.enabled and len(_CONNINS_LIB_CACHE) == 0:
+            raise RuntimeError(
+                f"KIAT_CONNINS=1 but no connector library at {lib_dir}; run "
+                "`PYTHONPATH=src python -m connector_insertion.build_library`.")
+    return _CONNINS_LIB_CACHE
+
 # Phase 9 uses random-per-source camera viewpoints; the 6 fixed names below
 # label the OUTPUT slots only, not specific axis-aligned orientations.
 # The Phase 10 ablation 'camera' variant also uses random views (view0..view5
@@ -1011,6 +1040,31 @@ def convert_one_video(args):
             wf_rng = np.random.RandomState(set_id * 1000 + frame_id + 401)
             wirefree = bool(wf_rng.uniform(0.0, 1.0) < P15_WIREFREE_P)
 
+        # 3D connector insertion (KIAT_CONNINS=1): plan the replacement of the
+        # harness connector points by real 3D models. Pure/immutable plan,
+        # applied at the combine step + anim loop below. The pristine ``pcl``
+        # keeps driving the bbox / floor placement / lighting centre. Skipped
+        # on wire-free frames (no harness is rendered then, see below).
+        conn_ins = None
+        conn_keep = None
+        if CONNINS_CFG.enabled:
+            if num_frames != 1:
+                raise RuntimeError(
+                    "KIAT_CONNINS=1 supports only static renders (num_frames == 1: "
+                    "phase9/11/12/13); animated modes would need the models to "
+                    "follow the skeleton.")
+            if CONNINS_CFG.zoom_views > 0 and DATASET_MODE not in ("phase12", "phase13"):
+                raise RuntimeError(
+                    "KIAT_CONNINS_ZOOM_VIEWS > 0 is supported for the static "
+                    "phase12/phase13 renders only.")
+            if not wirefree:
+                conn_ins = plan_connector_insertion(
+                    pcl, seg, point_rgb, CONNINS_CFG,
+                    _connins_make_rng(set_id, frame_id, CONNINS_CFG),
+                    _get_connins_library())
+                if conn_ins.active:
+                    conn_keep = ~conn_ins.drop_mask
+
         # ── Background scene ─────────────────────────────────────────────
         bg_library = _get_background_library()
         obj_library = _get_object_library()
@@ -1298,9 +1352,11 @@ def convert_one_video(args):
             ])
         else:
             combined_rgb = np.concatenate(
-                [point_rgb, bg_rgb, fg_rgb], axis=0).astype(np.uint8)
+                [point_rgb if conn_keep is None else point_rgb[conn_keep],
+                 bg_rgb, fg_rgb], axis=0).astype(np.uint8)
             combined_labels = np.concatenate([
-                seg.astype(np.int64),
+                seg.astype(np.int64) if conn_keep is None
+                else seg.astype(np.int64)[conn_keep],
                 np.full(len(bg_pcl), BG_LABEL, dtype=np.int64),
                 np.full(len(fg_pcl), BG_LABEL, dtype=np.int64),
             ])
@@ -1315,6 +1371,14 @@ def convert_one_video(args):
                     combined_labels,
                     np.zeros(wire_extra_pts.shape[0], dtype=np.int64),
                 ])
+            # 3D connector insertion: append the inserted model points LAST
+            # (after the wire tube), mirrored in combined_pcl in the anim loop.
+            # Un-lit BGR here; apply_scene_lighting later lights the whole cloud.
+            if conn_keep is not None:
+                combined_rgb = np.concatenate(
+                    [combined_rgb, conn_ins.extra_rgb], axis=0).astype(np.uint8)
+                combined_labels = np.concatenate(
+                    [combined_labels, conn_ins.extra_labels.astype(np.int64)])
 
         # Phase 13 lever (a): pick one distant-light direction per source
         # (separate rng). Applied per-anim-frame below once ``combined_pcl``
@@ -1369,6 +1433,12 @@ def convert_one_video(args):
         for d in dirs_to_make:
             d.mkdir(parents=True, exist_ok=True)
 
+        if conn_ins is not None:   # per-source planner report (only when enabled)
+            ci_dir = out_base / "connector_insertion"
+            ci_dir.mkdir(parents=True, exist_ok=True)
+            (ci_dir / f"{frame_id:04d}.json").write_text(
+                json.dumps(conn_ins.report, indent=1, default=float))
+
         lbl_path = lbl_dir / f"{frame_id:04d}.npy"
         if not lbl_path.exists():
             # [:n_pts_orig] drops the Phase 18 render-only density extras
@@ -1407,7 +1477,9 @@ def convert_one_video(args):
             if wirefree:
                 combined_pcl = np.concatenate([bg_pcl, fg_pcl], axis=0)
             else:
-                combined_pcl = np.concatenate([new_pcl, bg_pcl, fg_pcl], axis=0)
+                combined_pcl = np.concatenate(
+                    [new_pcl if conn_keep is None else new_pcl[conn_keep],
+                     bg_pcl, fg_pcl], axis=0)
                 # Phase 26.1: append the rest-pose densified wire tube so it
                 # aligns with combined_rgb/combined_labels (built above). phase13
                 # renders a single rest-pose anim frame (num_frames==1 ⇒
@@ -1417,6 +1489,9 @@ def convert_one_video(args):
                 if wire_extra_pts.shape[0]:
                     combined_pcl = np.concatenate(
                         [combined_pcl, wire_extra_pts], axis=0)
+                if conn_keep is not None:
+                    combined_pcl = np.concatenate(
+                        [combined_pcl, conn_ins.extra_pts], axis=0)
 
             # Phase 13 lever (a): bake the directional shading into the
             # per-point BGR for this frame's world positions. View-independent
@@ -1446,6 +1521,38 @@ def convert_one_video(args):
                     label3_img[(label_img == 0) & (depth > 0)] = 2
                     label3_img[label_img > 0] = 1
                     cv2.imwrite(str(lbl3_img_dir / fname), label3_img)
+
+            # 3D connector insertion ZOOM VIEWS (KIAT_CONNINS_ZOOM_VIEWS=N > 0,
+            # default OFF): N extra close-ups centred on connector slots, same
+            # 640x480 output, written AFTER the six standard views so those are
+            # unaffected. Own RandomState (offset 1531), see connector_insertion/zoom.py.
+            if (CONNINS_CFG.enabled and CONNINS_CFG.zoom_views > 0
+                    and conn_ins is not None and not wirefree):
+                _zoom_light = ((lambda P, C: apply_scene_lighting(
+                    P, C, light_dir, light_centre, ambient=P13_LIGHT_AMBIENT,
+                    gain=P13_LIGHT_GAIN, span=P13_LIGHT_SPAN))
+                    if light_dir is not None else None)
+                _zplans = _connins_plan_zoom(
+                    conn_ins, view_rotations, CONNINS_CFG, set_id, frame_id,
+                    pcl=pcl, seg=seg)
+                _zrend = _ConnInsZoomRenderer(
+                    CONNINS_CFG, conn_ins if conn_ins.active else None,
+                    combined_pcl, combined_labels, view_rgb, rasterize_view,
+                    photo_background, light=_zoom_light,
+                    skeleton=dict(pcl=pcl, seg=seg, na=na, nb=nb, nodes=nodes,
+                                  segments=segments))
+                _zinfo = []
+                for _zp in _zplans:
+                    _zr = _zrend.render(_zp)
+                    _zn = f"{frame_id:04d}_{ai:02d}_{_connins_zoom_name(_zp.index)}.png"
+                    cv2.imwrite(str(rgb_dir / _zn), _zr.rgb)
+                    cv2.imwrite(str(depth_dir / _zn), _zr.depth)
+                    cv2.imwrite(str(lbl_img_dir / _zn), _zr.label)
+                    _zinfo.append(_zr.info)
+                _rep = dict(conn_ins.report)
+                _rep["zoom_views"] = _zinfo
+                (out_base / "connector_insertion" / f"{frame_id:04d}.json").write_text(
+                    json.dumps(_rep, indent=1, default=float))
 
         return (set_id, frame_id, "ok", time.time() - t0)
 
@@ -1753,6 +1860,16 @@ def write_metadata(sets_found, num_frames, max_angle_deg, stats):
         },
         "background": _bg_meta_block,
         "foreground": _fg_meta_block,
+        **({"connector_insertion": CONNINS_CFG.to_dict()}
+           if CONNINS_CFG.enabled else {}),
+        # Zoom views are deliberately NOT listed under "views" so default staging
+        # (prepare_dformer_data.py) is unchanged; they are staged with --include-zoom.
+        **({"zoom_views": {
+                "names": [_connins_zoom_name(j) for j in range(CONNINS_CFG.zoom_views)],
+                "naming": "{src_frame:04d}_{anim_frame:02d}_zoom{j}.png in rgb/, depth/, label/ "
+                          "(a source without a slot may lack some or all of them)",
+                "report": "<split>/<set>/connector_insertion/<frame>.json key 'zoom_views'"}}
+           if (CONNINS_CFG.enabled and CONNINS_CFG.zoom_views > 0) else {}),
         "color_jitter": (
             {"per_source_hsv_jitter": True,
              "hue_shift_deg": 25.0,
