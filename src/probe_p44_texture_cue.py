@@ -29,12 +29,18 @@ MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
-def load_model(ckpt, device):
+def load_model(ckpt, device, auto_num_classes=False):
     from transformers import SegformerForSemanticSegmentation
-    m = SegformerForSemanticSegmentation.from_pretrained(
-        "nvidia/mit-b5", num_labels=3, ignore_mismatched_sizes=True)
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = sd.get("model_state_dict", sd)
+    # --auto-num-classes (default OFF): size the head from the checkpoint so a
+    # 2-class (bg/DLO) model can be probed; class 1 is then DLO (== WIRE here)
+    # and class 2 (CONN) is never predicted. Default keeps num_labels=3.
+    n_lab = 3
+    if auto_num_classes:
+        n_lab = int(sd["model.decode_head.classifier.weight"].shape[0])
+    m = SegformerForSemanticSegmentation.from_pretrained(
+        "nvidia/mit-b5", num_labels=n_lab, ignore_mismatched_sizes=True)
     sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
     missing, unexpected = m.load_state_dict(sd, strict=False)
     assert not [k for k in missing if "decode_head" in k or "encoder" in k], missing[:5]
@@ -74,6 +80,9 @@ def main():
     ap.add_argument("--extra-model", action="append", default=[],
                     metavar="NAME=CKPT",
                     help="additional model to score, e.g. p442=path/to/best_model.pth")
+    ap.add_argument("--auto-num-classes", action="store_true",
+                    help="size each model's head from its checkpoint (allows 2-class "
+                         "bg/DLO models; default OFF = historical num_labels=3)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = random.Random(0)
@@ -96,9 +105,11 @@ def main():
     for e in a.extra_model:
         name, _, ck = e.partition("=")
         specs[name] = ck
-    models = {k: load_model(v, a.device) for k, v in specs.items()}
+    models = {k: load_model(v, a.device, a.auto_num_classes)
+              for k, v in specs.items()}
 
     res = {m: {"real": [], "synth": []} for m in models}
+    res_w = {m: {"real": [], "synth": []} for m in models}  # only reported with --auto-num-classes
     for i, b in enumerate(bases):
         rgb = cv2.imread(os.path.join(a.data, "RGB", b + ".png"))
         lab = cv2.imread(os.path.join(a.data, "Label", b + ".png"), cv2.IMREAD_UNCHANGED)
@@ -142,6 +153,7 @@ def main():
             for name, mdl in models.items():
                 pred, _ = predict(mdl, frame, a.device)
                 res[name][kind].append(float((pred[m_all] == CONN).mean()))
+                res_w[name][kind].append(float((pred[m_all] == WIRE).mean()))
         if i % 30 == 0:
             print(f"  {i}/{len(bases)}", flush=True)
 
@@ -153,6 +165,16 @@ def main():
         s = float(np.mean(res[name]["synth"])) if res[name]["synth"] else float("nan")
         summary[name] = {"real": r, "synth": s, "n": len(res[name]["real"])}
         print(f"{name:10s} {r:>19.1%} {s:>23.1%}")
+    if a.auto_num_classes:
+        # extra (flag-only) table: for a 2-class model class 1 is DLO, so this is
+        # "fraction of pasted non-connector photo pixels called DLO/wire".
+        print("\n=== fraction of PASTED-OBJECT pixels predicted WIRE/DLO (class 1) ===")
+        for name in models:
+            r = float(np.mean(res_w[name]["real"])) if res_w[name]["real"] else float("nan")
+            s_ = float(np.mean(res_w[name]["synth"])) if res_w[name]["synth"] else float("nan")
+            summary[name]["real_wire"] = r
+            summary[name]["synth_wire"] = s_
+            print(f"{name:10s} {r:>19.1%} {s_:>23.1%}")
     json.dump(summary, open(os.path.join(a.out, "summary.json"), "w"), indent=2)
     print(f"\n-> {a.out}/summary.json")
 

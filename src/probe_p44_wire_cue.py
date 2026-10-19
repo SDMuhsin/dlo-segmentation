@@ -40,12 +40,18 @@ MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
-def load_model(ckpt, device):
+def load_model(ckpt, device, auto_num_classes=False):
     from transformers import SegformerForSemanticSegmentation
-    m = SegformerForSemanticSegmentation.from_pretrained(
-        "nvidia/mit-b5", num_labels=3, ignore_mismatched_sizes=True)
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = sd.get("model_state_dict", sd)
+    # --auto-num-classes (default OFF): size the head from the checkpoint so a
+    # 2-class (bg/DLO) model can be probed; class 1 is then DLO (== WIRE here)
+    # and class 2 (CONN) is never predicted. Default keeps num_labels=3.
+    n_lab = 3
+    if auto_num_classes:
+        n_lab = int(sd["model.decode_head.classifier.weight"].shape[0])
+    m = SegformerForSemanticSegmentation.from_pretrained(
+        "nvidia/mit-b5", num_labels=n_lab, ignore_mismatched_sizes=True)
     sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
     missing, _ = m.load_state_dict(sd, strict=False)
     assert not [k for k in missing if "decode_head" in k or "encoder" in k], missing[:5]
@@ -244,6 +250,9 @@ def main():
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--dump", type=int, default=8, help="save N qualitative panels")
     ap.add_argument("--extra-model", action="append", default=[], metavar="NAME=CKPT")
+    ap.add_argument("--auto-num-classes", action="store_true",
+                    help="size each model's head from its checkpoint (allows 2-class "
+                         "bg/DLO models; default OFF = historical num_labels=3)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = random.Random(0)
@@ -268,7 +277,8 @@ def main():
     for e in a.extra_model:
         name, _, ck = e.partition("=")
         specs[name] = ck
-    models = {k: load_model(v, a.device) for k, v in specs.items()}
+    models = {k: load_model(v, a.device, a.auto_num_classes)
+              for k, v in specs.items()}
 
     res = {m: {arm: {"wire": [], "conn": []} for arm in ARMS} for m in models}
     n_dumped = 0
